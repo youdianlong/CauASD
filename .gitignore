@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+logs/
+output/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.tar
+*.tar.gz
+experiments/label_identity_audit/pairs/
+experiments/label_identity_audit/audit_pairs.npz
