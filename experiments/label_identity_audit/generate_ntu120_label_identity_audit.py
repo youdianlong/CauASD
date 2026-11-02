@@ -374,8 +374,11 @@ def main() -> None:
         "Selected one sample per unseen class in each of split_4, split_5, and split_6.",
         "Each MP4 contains Original on the left and Transformed on the right.",
         "Action names are shown in the MP4; speed factors are omitted from the MP4 and recorded only in pair_key.csv.",
-        "Annotators should fill annotation_sheet.csv with Yes, No, or Uncertain.",
-        "Retention = Yes / (Yes + No + Uncertain).",
+        "Annotators independently select Yes or Uncertain in annotation_sheet.csv.",
+        "Confirmation rate = pairs where both annotators select Yes / all evaluated pairs.",
+        "All other completed judgments are unconfirmed, not established label changes; keep them in the denominator.",
+        "Blank ratings are missing data, not Uncertain.",
+        "Pairs reuse original sequences across factors; this is a contextual audit with category information.",
         "",
         "dataset: NTU-120",
         source_description,
@@ -385,7 +388,7 @@ def main() -> None:
         "pairs: {}".format(len(pair_rows)),
         "factors: {}".format(", ".join(str(x) for x in factors)),
         "split_counts: {}".format(split_counts),
-        "annotation_values: Yes, No, Uncertain",
+        "annotation_values: Yes, Uncertain",
         "rendered: {}".format(not args.no_render),
     ]
     (output / "README.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")

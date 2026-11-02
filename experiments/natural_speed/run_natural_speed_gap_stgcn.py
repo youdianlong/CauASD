@@ -42,25 +42,36 @@ def args():
 
 def speed_proxy(data):
     """Per-sample speed on original 50-frame input; excludes zero padding."""
-    x = data.cpu().numpy()
-    active = np.any(np.abs(x) > 1e-6, axis=(1, 3, 4))
-    delta = np.linalg.norm(x[:, :, 1:] - x[:, :, :-1], axis=1)
-    transition = active[:, 1:] & active[:, :-1]
-    total = (delta * transition[:, :, None, None]).sum(axis=(1, 2, 3), dtype=np.float64)
-    count = transition.sum(axis=1) * x.shape[3] * x.shape[4]
-    speed = total / np.maximum(count, 1)
-    root = x[:, :, :, :1, :]
-    extent = np.linalg.norm(x - root, axis=1)
-    extent = np.where(active[:, :, None, None], extent, np.nan)
-    invalid = ~active.any(axis=1)
-    extent[invalid, 0, 0, 0] = 1.0
+    x = np.asarray(data.cpu().numpy(), dtype=np.float32)
+    if x.ndim != 5 or x.shape[1] != 3:
+        raise ValueError("Expected data shape (N,3,T,V,M), got {}".format(x.shape))
+
+    if x.shape[2] < 2 or x.shape[3] < 1 or x.shape[4] < 1:
+        raise ValueError("Expected at least two frames, one joint and one body slot")
+    # Missing bodies are all-zero joint coordinates in a particular frame.
+    # Preserve the person axis: another active person must not validate an
+    # empty slot. Non-finite body frames are also excluded.
+    active = (np.any(np.abs(x) > 1e-6, axis=(1, 3))
+              & np.all(np.isfinite(x), axis=(1, 3)))  # N,T,M
+    transition = active[:, 1:, :] & active[:, :-1, :]  # N,T-1,M
+    with np.errstate(invalid="ignore", over="ignore"):
+        delta = np.linalg.norm(x[:, :, 1:] - x[:, :, :-1], axis=1)
+        extent = np.linalg.norm(x - x[:, :, :, :1, :], axis=1)
+    total = np.where(transition[:, :, None, :], delta, 0.0).sum(
+        axis=(1, 2, 3), dtype=np.float64)
+    count = transition.sum(axis=(1, 2), dtype=np.float64) * x.shape[3]
+    extent = np.where(active[:, :, None, :], extent, np.nan)
+    no_body = ~active.any(axis=(1, 2))
+    if no_body.any():
+        extent[no_body, 0, 0, 0] = 0.0  # avoid an all-NaN median warning
     scale = np.nanmedian(extent.reshape(len(x), -1), axis=1)
-    scale = np.where(
-        np.isfinite(scale) & (scale > 1e-6),
-        scale,
-        1.0,
-    )
-    return speed / scale
+    valid = ((count > 0) & np.isfinite(total)
+             & np.isfinite(scale) & (scale > 1e-6))
+    # A degenerate body has no meaningful normalized speed. Exclude it
+    # explicitly, rather than silently using coordinate-dependent scale=1.
+    result = np.full(len(x), np.nan, dtype=np.float64)
+    result[valid] = total[valid] / count[valid] / scale[valid]
+    return result
 
 
 def predict(checkpoint, loader, device, text, unseen):
@@ -81,6 +92,8 @@ def predict(checkpoint, loader, device, text, unseen):
 
 
 def groups(speed, labels):
+    if not np.isfinite(speed).all():
+        raise ValueError("Filter invalid body-normalized scores before stratification")
     slow = np.zeros(len(labels), bool); fast = np.zeros(len(labels), bool)
     for cls in np.unique(labels):
         idx = np.flatnonzero(labels == cls)
@@ -122,10 +135,19 @@ def main():
         not np.array_equal(labels, returned_labels)
         or not np.array_equal(labels, returned_labels_aug)
         or not np.array_equal(labels, returned_labels_2)
-        or not np.allclose(speed, speed_aug)
-        or not np.allclose(speed, speed_2)
+        or not np.allclose(speed, speed_aug, equal_nan=True)
+        or not np.allclose(speed, speed_2, equal_nan=True)
     ):
         raise RuntimeError("Prediction/sample alignment failed.")
+    n_total = len(labels)
+    valid = np.isfinite(speed)
+    if not valid.any():
+        raise ValueError("No samples have valid body-normalized speed")
+    excluded_indices = np.flatnonzero(~valid)
+    if len(excluded_indices):
+        print("warning: excluding {} samples without valid body-normalized speed".format(len(excluded_indices)))
+    labels, speed = labels[valid], speed[valid]
+    base_pred, aug_pred, cau_pred = base_pred[valid], aug_pred[valid], cau_pred[valid]
     condition = groups(np.log(np.maximum(speed, 1e-12)), labels)
     pgfa = accuracy(labels, base_pred, condition)
     pgfaaug = accuracy(labels, aug_pred, condition)
@@ -136,16 +158,28 @@ def main():
         w = csv.writer(f); w.writerow(["Method", "Naturally slower", "Middle", "Naturally faster", "Slow-fast gap"])
         for name, value in (("PGFA", pgfa), ("PGFAaug", pgfaaug), ("CauASD", cauasd)):
             w.writerow([name] + ["{:.2f}".format(100 * value[k]) for k in ("Naturally slower", "Middle", "Naturally faster", "Slow-fast gap")])
-    print(json.dumps({
+    metadata = {
         "dataset": dataset,
         "split": split,
+        "speed_proxy_version": "valid_body_transition_v2",
+        "n_total": n_total,
+        "n_excluded": int(len(excluded_indices)),
+        "excluded_sample_indices": excluded_indices.tolist(),
         "samples": len(labels),
         "groups": {k: int(v.sum()) for k, v in condition.items()},
         "PGFA": pgfa,
         "PGFAaug": pgfaaug,
         "CauASD": cauasd,
         "csv": output,
-    }, indent=2))
+    }
+    stem = os.path.splitext(output)[0]
+    with open(stem + ".json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+    np.savez_compressed(stem + ".npz", labels=labels,
+                        sample_indices=np.flatnonzero(valid), fixed_v50=speed,
+                        pgfa_prediction=base_pred, pgfaaug_prediction=aug_pred,
+                        cauasd_prediction=cau_pred)
+    print(json.dumps(metadata, indent=2))
 
 
 if __name__ == "__main__": main()

@@ -5,6 +5,7 @@ __pycache__/
 logs/
 output/
 checkpoints/
+/prototype/
 *.pt
 *.pth
 *.ckpt

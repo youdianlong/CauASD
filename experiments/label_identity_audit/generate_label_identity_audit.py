@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a blinded action-identity audit package for the legacy TCI.
+"""Generate a contextual paired action-identity audit package for legacy TCI.
 
 The script uses already-preprocessed fixed 50-frame skeletons.  It does not
 load a model or a checkpoint.  It samples a fixed, class-balanced set from
@@ -478,8 +478,8 @@ def main() -> None:
         "pairs": pair_counter,
         "factors": list(factors),
         "split_counts": {str(split): sum(row["split"] == split for row in key_rows[::len(factors)]) for split in DEFAULT_SPLITS},
-        "annotation_values": ["Yes", "No", "Uncertain"],
-        "retention_formula": "Yes / (Yes + No + Uncertain)",
+        "annotation_values": ["Yes", "Uncertain"],
+        "retention_formula": "both_yes_pairs / total_pairs",
         "note": "Retention is intentionally left for independent annotators; no model or checkpoint is used.",
     }
     with (output / "README.txt").open("w", encoding="utf-8") as handle:
@@ -487,14 +487,17 @@ def main() -> None:
         handle.write("===================================\n\n")
         handle.write("Open the files under pairs/. The left panel is Original and the right panel is Transformed.\n")
         handle.write("The speed factor is hidden from the annotation sheet; the action category is shown in each video.\n")
-        handle.write("Fill annotation_sheet.csv with Yes, No, or Uncertain in annotator_1 and annotator_2.\n")
+        handle.write("Independently fill annotator_1 and annotator_2 with Yes or Uncertain.\n")
         handle.write("Use pair_key.csv only after annotation to recover the factor and class.\n")
-        handle.write("Retention = Yes / (Yes + No + Uncertain).\n")
+        handle.write("Confirmation rate = pairs where both annotators select Yes / all evaluated pairs.\n")
+        handle.write("All other completed judgments are unconfirmed, not established label changes; keep them in the denominator.\n")
+        handle.write("Blank ratings are missing data, not Uncertain.\n")
+        handle.write("Pairs reuse original sequences across factors; this is a contextual audit with category information.\n")
         handle.write("\nGeneration summary:\n")
         for key, value in summary.items():
             handle.write("{}: {}\n".format(key, value))
 
-    print("Generated {} original samples and {} blinded pairs in {}".format(len(selected), pair_counter, output))
+    print("Generated {} original samples and {} contextual audit pairs in {}".format(len(selected), pair_counter, output))
     print("Annotation sheet: {}".format(output / "annotation_sheet.csv"))
     print("Boundary statistics: {}".format(output / "boundary_statistics.csv"))
 
