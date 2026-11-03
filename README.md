@@ -49,6 +49,9 @@ The temporal speed evaluations are provided in `experiments/`:
 - `test_variable_length_speed.py`: variable-length speed evaluation;
 - `natural_speed/`: natural-speed stratification and duration-aware sensitivity analysis.
 
+Evaluation protocols, commands, and available split-level results are documented in
+[Reproducibility](experiments/REPRODUCIBILITY.md).
+
 ## Author
 
 Author: Dianlong Y and Anqi Wang  

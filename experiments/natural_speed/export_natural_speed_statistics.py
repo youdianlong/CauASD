@@ -5,8 +5,9 @@ This is a post-processing script.  It does not train a model and does not
 modify any input data.  The fixed-length proxy is computed on the original
 unwarped ``unseen_data.npy`` using the same body-scale normalization,
 zero-padding handling, and within-class lower/upper 30-percent ranking used
-by ``run_natural_speed_gap_stgcn.py``.  In particular, zero-speed samples are
-retained, matching the original Table-V accuracy script.
+by ``run_natural_speed_gap_stgcn.py``. Static samples with valid body geometry
+and valid adjacent-frame transitions are retained. Samples without valid
+transitions or with degenerate body extent are explicitly excluded.
 
 The script writes:
 
@@ -17,6 +18,12 @@ The script writes:
     rank cutoffs, stratum counts, and the class-level score distribution.
 * ``natural_speed_by_stratum_<dataset>_split<split>.csv``
     One row per action class and stratum with distribution statistics.
+* ``natural_speed_class_macro_<dataset>_split<split>.csv`` and
+  ``natural_speed_s1_<dataset>_split<split>.tex``
+    Table-S1 summaries: every score/threshold column is an unweighted mean
+    over the same action classes; stratum counts are summed, not averaged.
+    The existing ``summary`` files remain pooled sample statistics, NOT
+    class-macro statistics. Do not mix their columns into Table S1.
 * ``natural_speed_correlations_<dataset>_split<split>.csv``
     Spearman correlations with the raw-time speed and original duration when
     ``--raw-time-speed-npz`` is supplied.
@@ -51,6 +58,15 @@ unwarped data and labels):
 
   python export_natural_speed_statistics.py --all-splits
 
+Rebuild Table S1 from an existing class-level export without loading skeletons:
+
+  python export_natural_speed_statistics.py \
+      --class-statistics-csv analysis/natural_speed_statistics/natural_speed_by_class_all_splits.csv \
+      --output-dir analysis/natural_speed_s1_checked
+
+This only checks and aggregates existing scores. It does not repair errors
+in the upstream speed definition or certify that those scores match Table V.
+
 In all-splits mode, the default relative layout is:
 
   data/zeroshot/<dataset>/split_<split>/unseen_data.npy
@@ -77,10 +93,16 @@ STRATA = ("slower", "middle", "faster")
 STAT_NAMES = ("mean", "std", "min", "q25", "median", "q75", "max")
 SPLIT_DATASET = {"1": "ntu60", "2": "ntu60", "3": "ntu60",
                  "4": "ntu120", "5": "ntu120", "6": "ntu120"}
+SPEED_PROXY_VERSION = "valid_body_transition_v2"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check-speed-proxy", action="store_true",
+                        help="Run deterministic synthetic padding/scale/missing-body checks; no data needed.")
+    parser.add_argument("--class-statistics-csv", default=None,
+                        help="Only validate/aggregate an existing by-class CSV into Table S1; "
+                             "no skeleton data or model checkpoints needed.")
     parser.add_argument("--all-splits", action="store_true",
                         help="Process NTU splits 1-6 in one command using --data-root.")
     parser.add_argument("--data-root", default="data/zeroshot",
@@ -148,29 +170,32 @@ def speed_proxy_batch(x):
     if x.ndim != 5 or x.shape[1] != 3:
         raise ValueError("Expected (N,3,T,V,M), got {}".format(x.shape))
 
-    active = np.any(np.abs(x) > 1e-6, axis=(1, 3, 4))  # N,T
-    delta = np.linalg.norm(x[:, :, 1:] - x[:, :, :-1], axis=1)  # N,T-1,V,M
-    transition = active[:, 1:] & active[:, :-1]
-    total = (delta * transition[:, :, None, None]).sum(
+    if x.shape[2] < 2 or x.shape[3] < 1 or x.shape[4] < 1:
+        raise ValueError("Expected at least two frames, one joint and one body slot")
+    # Missing bodies are all-zero joint coordinates in a particular frame.
+    # Preserve the person axis: another active person must not validate an
+    # empty slot. Non-finite body frames are also excluded.
+    active = (np.any(np.abs(x) > 1e-6, axis=(1, 3))
+              & np.all(np.isfinite(x), axis=(1, 3)))  # N,T,M
+    transition = active[:, 1:, :] & active[:, :-1, :]  # N,T-1,M
+    with np.errstate(invalid="ignore", over="ignore"):
+        delta = np.linalg.norm(x[:, :, 1:] - x[:, :, :-1], axis=1)
+        extent = np.linalg.norm(x - x[:, :, :, :1, :], axis=1)
+    total = np.where(transition[:, :, None, :], delta, 0.0).sum(
         axis=(1, 2, 3), dtype=np.float64)
-    count = transition.sum(axis=1, dtype=np.float64) * x.shape[3] * x.shape[4]
-    speed = total / np.maximum(count, 1.0)
-
-    root = x[:, :, :, :1, :]
-    extent = np.linalg.norm(x - root, axis=1)  # N,T,V,M
-    extent = np.where(active[:, :, None, None], extent, np.nan)
-    invalid = ~active.any(axis=1)
-    if invalid.any():
-        extent[invalid, 0, 0, 0] = 1.0
+    count = transition.sum(axis=(1, 2), dtype=np.float64) * x.shape[3]
+    extent = np.where(active[:, :, None, :], extent, np.nan)
+    no_body = ~active.any(axis=(1, 2))
+    if no_body.any():
+        extent[no_body, 0, 0, 0] = 0.0  # avoid an all-NaN median warning
     scale = np.nanmedian(extent.reshape(len(x), -1), axis=1)
-    # Match run_natural_speed_gap_stgcn.py exactly.  Invalid or degenerate
-    # body scales use a neutral fallback instead of amplifying the proxy.
-    scale = np.where(
-        np.isfinite(scale) & (scale > 1e-6),
-        scale,
-        1.0,
-    )
-    return speed / scale, count
+    valid = ((count > 0) & np.isfinite(total)
+             & np.isfinite(scale) & (scale > 1e-6))
+    # A degenerate body has no meaningful normalized speed. Exclude it
+    # explicitly, rather than silently using coordinate-dependent scale=1.
+    result = np.full(len(x), np.nan, dtype=np.float64)
+    result[valid] = total[valid] / count[valid] / scale[valid]
+    return result, count
 
 
 def compute_fixed_speed(path, batch_size):
@@ -184,6 +209,48 @@ def compute_fixed_speed(path, batch_size):
         values[start:stop], transitions[start:stop] = speed_proxy_batch(data[start:stop])
         print("fixed speed: {}/{}".format(stop, len(data)), flush=True)
     return values, transitions
+
+
+def check_speed_proxy():
+    """Small, deterministic public checks for the corrected proxy."""
+    x = np.zeros((1, 3, 50, 5, 1), dtype=np.float32)
+    x[0, 0, :, :, 0] = (0.2 * np.arange(50)[:, None]
+                         + 5.0 * np.arange(5)[None, :])
+    padded = np.concatenate([x, np.zeros_like(x)], axis=-1)
+    base, count = speed_proxy_batch(x)
+    one_empty, _ = speed_proxy_batch(padded)
+    doubled, _ = speed_proxy_batch(2.0 * padded)
+    swapped, _ = speed_proxy_batch(padded[..., ::-1])
+    for label, value in (("base", base), ("empty_slot", one_empty),
+                         ("double_coordinates", doubled), ("slot_order", swapped)):
+        if not np.allclose(value, 0.02, rtol=1e-6, atol=1e-9):
+            raise AssertionError("{} invariance check failed: {}".format(label, value))
+    if count[0] != 49 * 5:
+        raise AssertionError("Invalid adjacent-frame joint count")
+    missing = padded.copy()
+    missing[:, :, 20:30, :, :] = 0
+    missing_speed, missing_count = speed_proxy_batch(missing)
+    if not np.allclose(missing_speed, base, rtol=1e-6, atol=1e-9):
+        raise AssertionError("Missing-body entry/exit was included in displacement")
+    if missing_count[0] != (19 + 19) * 5:
+        raise AssertionError("Missing-body transition count is incorrect")
+    static = np.repeat(x[:, :, :1], 50, axis=2)
+    static_speed, _ = speed_proxy_batch(static)
+    empty_speed, _ = speed_proxy_batch(np.zeros_like(padded))
+    degenerate_speed, _ = speed_proxy_batch(np.ones_like(padded))
+    if static_speed[0] != 0 or not np.isnan(empty_speed[0]) or not np.isnan(degenerate_speed[0]):
+        raise AssertionError("Static/empty/degenerate sample policy failed")
+    return {
+        "speed_proxy_version": SPEED_PROXY_VERSION,
+        "one_valid_body": float(base[0]),
+        "with_empty_slot": float(one_empty[0]),
+        "with_empty_slot_coordinates_x2": float(doubled[0]),
+        "body_slot_order_invariant": True,
+        "missing_body_transitions_excluded": True,
+        "static_valid_body_speed": float(static_speed[0]),
+        "empty_or_degenerate_samples_excluded": True,
+        "checks_passed": True,
+    }
 
 
 def normalise_name(value):
@@ -346,12 +413,17 @@ def run_all_splits(args):
                 args.output_dir,
                 prefix + "{}_split{}.csv".format(SPLIT_DATASET[split], split),
             )
-            for split in requested
+            for split in (item["split"] for item in completed)
         ]
         output = os.path.join(args.output_dir, prefix + "all_splits.csv")
         merged = merge_csvs(paths, output)
         if merged is not None:
             combined[key] = os.path.abspath(merged)
+
+    if "by_class" in combined:
+        with open(combined["by_class"], "r", newline="", encoding="utf-8-sig") as handle:
+            class_rows = list(csv.DictReader(handle))
+        combined.update(write_s1_outputs(class_rows, args.output_dir, "all_splits"))
 
     metadata = {
         "data_root": os.path.abspath(data_root),
@@ -507,6 +579,98 @@ def add_stats(row, values):
     return row
 
 
+def class_macro_rows(class_rows):
+    """Aggregate the same complete class rows for EVERY S1 score column."""
+    columns = ("q30", "q70", "mean", "std", "median")
+    count_columns = ("class_n", "slower_n", "middle_n", "faster_n")
+    grouped = {}
+    seen = set()
+    for row in class_rows:
+        try:
+            key = tuple(str(row[name]) for name in ("dataset", "split", "speed_definition"))
+            class_id = int(row["class_id"])
+            values = {name: float(row[name]) for name in columns}
+            counts = {name: int(row[name]) for name in count_columns}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Incomplete or invalid class-level statistics: {}".format(row)) from exc
+        identity = key + (class_id,)
+        if identity in seen:
+            raise ValueError("Duplicate class-level record: {}".format(identity))
+        seen.add(identity)
+        if not all(math.isfinite(value) for value in values.values()):
+            raise ValueError("Non-finite class-level statistics: {}".format(identity))
+        if not values["q30"] <= values["median"] <= values["q70"]:
+            raise ValueError("Expected q30 <= median <= q70 for {}".format(identity))
+        if values["std"] < 0 or min(counts.values()) < 0 or counts["class_n"] == 0:
+            raise ValueError("Invalid standard deviation or sample count: {}".format(identity))
+        if counts["class_n"] != sum(counts[name + "_n"] for name in STRATA):
+            raise ValueError("Stratum counts do not sum to class_n: {}".format(identity))
+        grouped.setdefault(key, []).append((values, counts))
+    if not grouped:
+        raise ValueError("No class-level statistics to aggregate")
+
+    output = []
+    for key, entries in sorted(grouped.items()):
+        result = dict(zip(("dataset", "split", "speed_definition"), key))
+        result["n_classes"] = len(entries)
+        for name in columns:
+            result["avg_" + name] = math.fsum(values[name] for values, _ in entries) / len(entries)
+        for name in count_columns:
+            result[name] = sum(counts[name] for _, counts in entries)
+        if not result["avg_q30"] <= result["avg_median"] <= result["avg_q70"]:
+            raise ValueError("Class-macro quantile order failed: {}".format(key))
+        output.append(result)
+    return output
+
+
+def s1_latex(rows):
+    """Render fixed-length S1 without substituting pooled split summaries."""
+    rows = [row for row in rows if row["speed_definition"] == "fixed50_body_scale_proxy"]
+    if not rows:
+        raise ValueError("Table S1 needs fixed50_body_scale_proxy class-level rows")
+    lines = [
+        r"\begin{table*}[t]",
+        r"\centering",
+        r"\caption{Statistics of within-class speed stratification. Threshold and score "
+        r"summaries are unweighted arithmetic means over action classes within each split. "
+        r"S/M/F denotes sample counts. Averaged thresholds are descriptive summaries, "
+        r"not shared cutoffs; class-specific thresholds are provided in the class-level export.}",
+        r"\label{tab:natural_speed_statistics}",
+        r"\renewcommand{\arraystretch}{1.08}",
+        r"\resizebox{\textwidth}{!}{%",
+        r"\begin{tabular}{llrrrrrrr}",
+        r"\hline",
+        r"Dataset & Split & \#Cls. & \multicolumn{2}{c}{Class-wise thresholds} & "
+        r"\multicolumn{3}{c}{Class-wise score summaries} & Sample counts \\",
+        r" & & & Avg. $q_{30}$ & Avg. $q_{70}$ & Avg. Mean & Avg. Std & Avg. Median & S/M/F \\",
+        r"\hline",
+    ]
+    datasets = {"ntu60": "NTU-60", "ntu120": "NTU-120"}
+    for row in rows:
+        dataset = datasets.get(row["dataset"])
+        if dataset is None:
+            raise ValueError("Unsupported Table-S1 dataset: {}".format(row["dataset"]))
+        fields = [dataset, str(int(row["split"])), str(row["n_classes"])]
+        fields.extend("{:.4f}".format(row["avg_" + name])
+                      for name in ("q30", "q70", "mean", "std", "median"))
+        fields.append("{}/{}/{}".format(row["slower_n"], row["middle_n"], row["faster_n"]))
+        lines.append(" & ".join(fields) + r" \\")
+    lines.extend([r"\hline", r"\end{tabular}", "}", r"\end{table*}"])
+    return "\n".join(lines) + "\n"
+
+
+def write_s1_outputs(class_rows, output_dir, tag):
+    rows = class_macro_rows(class_rows)
+    latex = s1_latex(rows)
+    os.makedirs(output_dir, exist_ok=True)
+    macro_path = os.path.join(output_dir, "natural_speed_class_macro_{}.csv".format(tag))
+    latex_path = os.path.join(output_dir, "natural_speed_s1_{}.tex".format(tag))
+    write_csv(macro_path, rows)
+    with open(latex_path, "w", encoding="utf-8") as handle:
+        handle.write(latex)
+    return {"class_macro": os.path.abspath(macro_path), "s1_latex": os.path.abspath(latex_path)}
+
+
 def build_rows(dataset, split, definition, speed, labels, fraction):
     groups, details = make_groups(speed, labels, fraction)
     class_rows = []
@@ -590,6 +754,20 @@ def prediction_accuracy_rows(definition, speed, labels, groups, predictions):
 
 def main():
     args = parse_args()
+    if args.check_speed_proxy:
+        print(json.dumps(check_speed_proxy(), indent=2))
+        return
+    if args.class_statistics_csv:
+        if args.all_splits or args.data or args.labels:
+            raise ValueError("--class-statistics-csv is a standalone aggregation mode")
+        with open(args.class_statistics_csv, "r", newline="", encoding="utf-8-sig") as handle:
+            class_rows = list(csv.DictReader(handle))
+        outputs = write_s1_outputs(class_rows, args.output_dir, "all_splits")
+        print("Checked class-macro aggregation only; upstream speed scores are unchanged.")
+        print("Source: " + os.path.abspath(args.class_statistics_csv))
+        print(json.dumps(outputs, indent=2, ensure_ascii=False))
+        print(s1_latex(class_macro_rows(class_rows)))
+        return
     if args.all_splits:
         run_all_splits(args)
         return
@@ -608,10 +786,10 @@ def main():
         raise ValueError("Sample-name/data length mismatch")
 
     fixed_speed, transitions = compute_fixed_speed(args.data, args.batch_size)
-    # Keep zero-speed samples to match run_natural_speed_gap_stgcn.py.  That
-    # script uses log(max(speed, 1e-12)) for ranking rather than removing
-    # samples with no valid transition.
+    # Keep genuine static samples, but exclude invalid geometry/transitions.
     fixed_valid = np.isfinite(fixed_speed)
+    if not fixed_valid.any():
+        raise ValueError("No samples have valid body extent and adjacent-frame transitions")
     if not fixed_valid.all():
         print("warning: excluding {} samples without a valid fixed-speed value"
               .format(int((~fixed_valid).sum())), flush=True)
@@ -649,6 +827,9 @@ def main():
             args.dataset, args.split, definition, local_speed, local_labels, args.fraction)
         summary["n_total"] = int(len(labels))
         summary["n_excluded"] = int(len(labels) - len(local_labels))
+        version = SPEED_PROXY_VERSION if definition == "fixed50_body_scale_proxy" else "raw_time_archive"
+        for row in [summary] + class_rows + stratum_rows:
+            row["speed_proxy_version"] = version
         all_summary.append(summary)
         all_class_rows.extend(class_rows)
         all_stratum_rows.extend(stratum_rows)
@@ -696,6 +877,7 @@ def main():
     write_csv(summary_path, all_summary)
     write_csv(class_path, all_class_rows)
     write_csv(stratum_path, all_stratum_rows)
+    s1_outputs = write_s1_outputs(all_class_rows, args.output_dir, tag)
     write_csv(corr_path, correlation_rows)
     if all_accuracy_rows:
         write_csv(accuracy_path, all_accuracy_rows)
@@ -709,6 +891,16 @@ def main():
         "raw_time_speed_npz": (os.path.abspath(args.raw_time_speed_npz)
                                 if args.raw_time_speed_npz else None),
         "fraction": args.fraction,
+        "fixed_speed_proxy_version": SPEED_PROXY_VERSION,
+        "fixed_speed_validity": {
+            "missing_body": "all-zero joint coordinates in a person slot/frame",
+            "active_body": "finite coordinates with at least one absolute coordinate > 1e-6",
+            "transition": "same body slot active in both adjacent frames",
+            "body_scale": "median root-relative joint extent over active body frames only",
+            "invalid_policy": "exclude no-transition or non-finite/extent<=1e-6 samples; no scale=1 fallback",
+            "n_excluded": int((~fixed_valid).sum()),
+            "excluded_sample_indices": np.flatnonzero(~fixed_valid).tolist(),
+        },
         "definition_rows": all_summary,
         "outputs": {
             "summary": os.path.abspath(summary_path),
@@ -716,6 +908,7 @@ def main():
             "by_stratum": os.path.abspath(stratum_path),
             "correlations": os.path.abspath(corr_path),
             "accuracy": os.path.abspath(accuracy_path) if all_accuracy_rows else None,
+            **s1_outputs,
         },
     }
     with open(metadata_path, "w", encoding="utf-8") as handle:
